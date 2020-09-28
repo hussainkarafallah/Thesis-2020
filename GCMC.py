@@ -11,11 +11,15 @@ import argparse
 device = "cuda"
 
 
+def get_SAGEConv( in_feats , hid_feats , agg = 'mean' , activation = F.relu , bias = True , norm = None):
+    return dglnn.conv.SAGEConv( in_feats , hid_feats , agg , activation= activation , bias=bias, norm=norm)
 
-
+def get_GATConv(in_feats, hid_feats, num_heads = 1, feat_drop=0.4, attn_drop=0.4, activation=F.relu):
+    return dglnn.conv.GATConv(in_feats , hid_feats , num_heads=num_heads , feat_drop=feat_drop , attn_drop=attn_drop
+                              , activation = activation)
 class MovieLensNetwork(torch.nn.Module):
 
-    def __init__(self, in_feats, hid_feats, ufeats, mfeats, ratings , main_layer = 'SAGE'):
+    def __init__(self, in_feats, hid_feats, conv_depth , ufeats, mfeats, ratings , main_layer = 'SAGE'):
 
         super(MovieLensNetwork, self).__init__()
 
@@ -24,6 +28,8 @@ class MovieLensNetwork(torch.nn.Module):
         self.userfeatures = nn.Parameter(ufeats)
         self.moviefeatures = nn.Parameter(mfeats)
         self.feats = nn.ParameterDict({"user": self.userfeatures, "movie": self.moviefeatures})
+        self.conv_depth = conv_depth
+        self.main_layer = main_layer
 
         print(self.userfeatures.shape)
         print(self.moviefeatures.shape)
@@ -34,22 +40,42 @@ class MovieLensNetwork(torch.nn.Module):
 
         self.hid_feats = hid_feats
 
-        conv1dict, conv2dict = nn.ModuleDict(), nn.ModuleDict()
+        self.conv_dictionaries = nn.ModuleList([nn.ModuleDict() for _ in range(self.conv_depth)])
 
-        for i in range(1, self.ratings + 1):
-            conv1dict[str(i) + "u"] = dglnn.conv.SAGEConv((self.userfdim, self.moviefdim), self.hid_feats, 'mean',
-                                                          activation=F.relu, bias=True, norm=F.normalize)
-            conv1dict[str(i) + "m"] = dglnn.conv.SAGEConv((self.moviefdim, self.userfdim), self.hid_feats, 'mean',
-                                                          activation=F.relu, bias=True, norm=F.normalize)
 
-            conv2dict[str(i) + "u"] = dglnn.conv.SAGEConv((self.ratings * self.hid_feats), self.hid_feats, 'mean',
-                                                          activation=F.relu, bias=True)  # , norm = F.normalize)
-            conv2dict[str(i) + "m"] = dglnn.conv.SAGEConv((self.ratings * self.hid_feats), self.hid_feats, 'mean',
-                                                          activation=F.relu, bias=True)  # , norm = F.normalize)
+        #conv1dict, conv2dict = nn.ModuleDict(), nn.ModuleDict()
 
-        self.conv1 = dglnn.HeteroGraphConv(conv1dict, aggregate='stack')
+        print(self.main_layer)
 
-        #self.conv2 = dglnn.HeteroGraphConv(conv2dict, aggregate='stack')
+        for (idx , curconv_dict) in enumerate(self.conv_dictionaries):
+
+            norm = F.normalize
+
+            if idx == 0:
+                in_feats1 = (self.userfdim, self.moviefdim)
+                in_feats2 = (self.moviefdim, self.userfdim)
+            else:
+                in_feats1 = (self.ratings * self.hid_feats)
+                in_feats2 = (self.ratings * self.hid_feats)
+
+            if idx == len(self.conv_dictionaries) - 1:
+                norm = None
+
+
+            for i in range(1, self.ratings + 1):
+                if self.main_layer == 'SAGE':
+                    curconv_dict[str(i) + "u"] = get_SAGEConv(in_feats1 , self.hid_feats , 'mean' , activation=F.relu,
+                                                      bias = True , norm = norm)
+                    curconv_dict[str(i) + "m"] = get_SAGEConv(in_feats2, self.hid_feats, 'mean', activation=F.relu,
+                                                      bias=True, norm=norm)
+                if self.main_layer == 'GAT':
+                    curconv_dict[str(i) + "u"] = get_GATConv(in_feats1, self.hid_feats,  activation=F.relu)
+
+                    curconv_dict[str(i) + "m"] = get_GATConv(in_feats2, self.hid_feats,  activation=F.relu)
+
+
+
+        self.convs = nn.ModuleList([dglnn.HeteroGraphConv(convdict, aggregate='stack') for convdict in self.conv_dictionaries])
 
         self.decoders = nn.ParameterDict({
             str(i): nn.Parameter(
@@ -70,15 +96,16 @@ class MovieLensNetwork(torch.nn.Module):
 
     def forward(self, G):
 
+        assert(len(self.convs) > 0)
         # x = x.to(self.device)
 
         # convolution over the 1st layer
-        res = self.conv1(G, (self.feats, self.feats))
+        res = self.convs[0](G, (self.feats, self.feats))
         self.relax(res)
 
-        # convolution over the 2nd layer
-        #res = self.conv2(G, (res, res))
-        #self.relax(res)
+        for i in range(1 , len(self.convs)):
+            res = self.convs[i](G, (res, res))
+            self.relax(res)
 
         probs_tensors = []
 
@@ -102,6 +129,7 @@ class MovieLensNetwork(torch.nn.Module):
         return probs_tensors
 
 mainLayer = 'SAGE'
+conv_depth = 1
 
 def load_graph(DATA_PATH , fname):
     print(os.path.join(DATA_PATH, fname))
@@ -152,9 +180,6 @@ def go_train(model , train_G , test_G):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
 
-
-    rating_types = ["1", "2", "3", "4", "5"]
-
     epochs = 2000
 
     best = 1e20
@@ -192,10 +217,14 @@ def run(DATA_PATH):
     ufeats = users_feats.shape[1]
     vfeats = movies_feats.shape[1]
 
+    print("mensss")
+    print(mainLayer)
+    print(conv_depth)
 
-    model = MovieLensNetwork((ufeats, vfeats), 75, 75, users_feats, movies_feats, 5)
+    model = MovieLensNetwork((ufeats, vfeats), hid_feats=75 , conv_depth= conv_depth, ufeats=users_feats, mfeats=movies_feats,
+                             ratings=5 , main_layer= mainLayer)
 
-
+    #return
     go_train(model , train_G , test_G)
 
 if __name__ == '__main__':
@@ -207,6 +236,16 @@ if __name__ == '__main__':
         help = "The depth of the graph neural network (>2 isn't ideal at all)")
 
     DATA_PATH = "./data/ml-100k_processednew/"
+
+    args = parser.parse_args()
+
+    if args.layer:
+        assert args.layer in ['SAGE' , 'GAT']
+        mainLayer = args.layer
+
+    if args.depth:
+        assert args.depth > 0
+        conv_depth = args.depth
 
     run(DATA_PATH)
 
