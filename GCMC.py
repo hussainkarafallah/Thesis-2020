@@ -14,16 +14,19 @@ device = "cuda"
 def get_SAGEConv( in_feats , hid_feats , agg = 'mean' , activation = F.relu , bias = True , norm = None):
     return dglnn.conv.SAGEConv( in_feats , hid_feats , agg , activation= activation , bias=bias, norm=norm)
 
-def get_GATConv(in_feats, hid_feats, num_heads = 1, feat_drop=0.4, attn_drop=0.4, activation=F.relu):
+def get_GATConv(in_feats, hid_feats, num_heads = 1, feat_drop=0.3, attn_drop=0.3, activation=F.relu):
     return dglnn.conv.GATConv(in_feats , hid_feats , num_heads=num_heads , feat_drop=feat_drop , attn_drop=attn_drop
                               , activation = activation)
+def get_GCNConv(in_feats , hid_feats , norm = 'both' , activation = F.relu):
+    return dgl.nn.pytorch.conv.GraphConv(in_feats, hid_feats, norm= norm , activation = activation)
+
 class MovieLensNetwork(torch.nn.Module):
 
     def __init__(self, in_feats, hid_feats, conv_depth , ufeats, mfeats, ratings , main_layer = 'SAGE'):
 
         super(MovieLensNetwork, self).__init__()
 
-        assert (in_feats == (ufeats.shape[1], mfeats.shape[1]))
+        #assert (in_feats == (ufeats.shape[1], mfeats.shape[1]))
 
         self.userfeatures = nn.Parameter(ufeats)
         self.moviefeatures = nn.Parameter(mfeats)
@@ -36,7 +39,7 @@ class MovieLensNetwork(torch.nn.Module):
 
         self.ratings = ratings
 
-        self.userfdim, self.moviefdim = in_feats
+        self.in_feats = in_feats
 
         self.hid_feats = hid_feats
 
@@ -45,35 +48,29 @@ class MovieLensNetwork(torch.nn.Module):
 
         #conv1dict, conv2dict = nn.ModuleDict(), nn.ModuleDict()
 
-        print(self.main_layer)
-
         for (idx , curconv_dict) in enumerate(self.conv_dictionaries):
 
             norm = F.normalize
 
             if idx == 0:
-                in_feats1 = (self.userfdim, self.moviefdim)
-                in_feats2 = (self.moviefdim, self.userfdim)
+                in_feats = self.in_feats
             else:
-                in_feats1 = (self.ratings * self.hid_feats)
-                in_feats2 = (self.ratings * self.hid_feats)
-
-            if idx == len(self.conv_dictionaries) - 1:
-                norm = None
+                in_feats = (self.ratings * self.hid_feats)
 
 
             for i in range(1, self.ratings + 1):
                 if self.main_layer == 'SAGE':
-                    curconv_dict[str(i) + "u"] = get_SAGEConv(in_feats1 , self.hid_feats , 'mean' , activation=F.relu,
+                    curconv_dict[str(i) + "u"] = get_SAGEConv(in_feats , self.hid_feats , 'mean' , activation=F.relu,
                                                       bias = True , norm = norm)
-                    curconv_dict[str(i) + "m"] = get_SAGEConv(in_feats2, self.hid_feats, 'mean', activation=F.relu,
+                    curconv_dict[str(i) + "m"] = get_SAGEConv(in_feats, self.hid_feats, 'mean', activation=F.relu,
                                                       bias=True, norm=norm)
                 if self.main_layer == 'GAT':
-                    curconv_dict[str(i) + "u"] = get_GATConv(in_feats1, self.hid_feats,  activation=F.relu)
+                    curconv_dict[str(i) + "u"] = get_GATConv(in_feats, self.hid_feats,  activation=F.relu)
+                    curconv_dict[str(i) + "m"] = get_GATConv(in_feats, self.hid_feats,  activation=F.relu)
 
-                    curconv_dict[str(i) + "m"] = get_GATConv(in_feats2, self.hid_feats,  activation=F.relu)
-
-
+                if self.main_layer == 'GCN':
+                    curconv_dict[str(i) + "u"] = get_GCNConv(in_feats, self.hid_feats, activation=F.relu)
+                    curconv_dict[str(i) + "m"] = get_GCNConv(in_feats, self.hid_feats, activation=F.relu)
 
         self.convs = nn.ModuleList([dglnn.HeteroGraphConv(convdict, aggregate='stack') for convdict in self.conv_dictionaries])
 
@@ -211,17 +208,35 @@ def go_train(model , train_G , test_G):
         kbar.add(1, values=[("loss", loss), ("acc", acc), ("tr_rmse", tr_rmse) , ("val_rmse" , val_rmse)])
 
 
-def run(DATA_PATH):
-    train_G , test_G , users_feats , movies_feats = load_data(DATA_PATH)
+def preprocess(users_feats , movies_feats):
+    nusers = users_feats.shape[0]
+    nmovies = movies_feats.shape[0]
 
     ufeats = users_feats.shape[1]
     vfeats = movies_feats.shape[1]
 
-    print("mensss")
-    print(mainLayer)
-    print(conv_depth)
+    print(movies_feats)
 
-    model = MovieLensNetwork((ufeats, vfeats), hid_feats=75 , conv_depth= conv_depth, ufeats=users_feats, mfeats=movies_feats,
+    users_feats = torch.cat ([ torch.zeros( (nusers , vfeats) ) , users_feats] , dim = 1)
+    movies_feats = torch.cat( [movies_feats , torch.zeros(nmovies, ufeats)] , dim = 1)
+
+    print(movies_feats.max() , movies_feats.min() , users_feats.max() , users_feats.min())
+
+    return users_feats , movies_feats
+
+def run(DATA_PATH):
+    train_G , test_G , users_feats , movies_feats = load_data(DATA_PATH)
+
+    users_feats , movies_feats = preprocess(users_feats , movies_feats)
+    assert users_feats.shape[1] == movies_feats.shape[1]
+
+    features_length = users_feats.shape[1]
+
+    print("mensss")
+    print("layer: ",mainLayer)
+    print("depth: ",conv_depth)
+
+    model = MovieLensNetwork(features_length, hid_feats=75 , conv_depth= conv_depth, ufeats=users_feats, mfeats=movies_feats,
                              ratings=5 , main_layer= mainLayer)
 
     #return
@@ -240,7 +255,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.layer:
-        assert args.layer in ['SAGE' , 'GAT']
+        assert args.layer in ['SAGE' , 'GAT' , 'GCN']
         mainLayer = args.layer
 
     if args.depth:
