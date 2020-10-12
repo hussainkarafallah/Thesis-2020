@@ -72,29 +72,4 @@ def gen_embeddings(hetero_graph):
         opt.step()
         print(loss.item())
 
-def run(DATA_PATH):
-
-    train_G , test_G  = load_data(DATA_PATH)
-
-    graphs = []
-
-    for rating in range(1 , ratings + 1):
-        sub = dgl.edge_type_subgraph(train_G , [ ("user", str(rating) + "u", "movie") ])
-        sub = dgl.to_homogeneous(sub)
-        sub = dgl.to_bidirected(sub)
-        graphs.append(sub)
-
-    for graph in graphs:
-        embeddings = gen_embeddings(graph)
-
-
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-
-    DATA_PATH = "./data/ml-100k_processednew/"
-
-    args = parser.parse_args()
-
-    run(DATA_PATH)
+    return hetero_graph.nodes['user'].data['feature'] ,  hetero_graph.nodes['item'].data['feature']
